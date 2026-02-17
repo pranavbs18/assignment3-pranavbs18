@@ -1,80 +1,105 @@
 #!/bin/bash
-# Script outline to install and build kernel.
-# Author: Siddhant Jajoo.
-
 set -e
-set -u
 
-OUTDIR=/tmp/aeld
-KERNEL_REPO=git://git.kernel.org/pub/scm/linux/kernel/git/stable/linux-stable.git
+SCRIPT_DIR=$(dirname "$(realpath "$0")")
+REPO_ROOT=$(realpath "$SCRIPT_DIR/..")
+
+OUTDIR=${1:-/tmp/aeld}
+OUTDIR=$(realpath "$OUTDIR")
+
+KERNEL_REPO=https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
 KERNEL_VERSION=v5.15.163
-BUSYBOX_VERSION=1_33_1
-FINDER_APP_DIR=$(realpath $(dirname $0))
+BUSYBOX_VERSION=1.36.1
+
 ARCH=arm64
 CROSS_COMPILE=aarch64-none-linux-gnu-
 
-if [ $# -lt 1 ]
-then
-	echo "Using default directory ${OUTDIR} for output"
-else
-	OUTDIR=$1
-	echo "Using passed directory ${OUTDIR} for output"
+echo "Using OUTDIR: $OUTDIR"
+
+mkdir -p "$OUTDIR"
+mkdir -p "$OUTDIR/rootfs"
+
+################################
+# Build Linux Kernel
+################################
+
+if [ ! -d "$OUTDIR/linux-stable" ]; then
+    git clone --depth 1 --branch ${KERNEL_VERSION} $KERNEL_REPO $OUTDIR/linux-stable
 fi
 
-mkdir -p ${OUTDIR}
+cd $OUTDIR/linux-stable
 
-cd "$OUTDIR"
-if [ ! -d "${OUTDIR}/linux-stable" ]; then
-    #Clone only if the repository does not exist.
-	echo "CLONING GIT LINUX STABLE VERSION ${KERNEL_VERSION} IN ${OUTDIR}"
-	git clone ${KERNEL_REPO} --depth 1 --single-branch --branch ${KERNEL_VERSION}
+if [ ! -f "arch/${ARCH}/boot/Image" ]; then
+
+	make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
+	make -j$(nproc) ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} Image
 fi
-if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
-    cd linux-stable
-    echo "Checking out version ${KERNEL_VERSION}"
-    git checkout ${KERNEL_VERSION}
+cp arch/${ARCH}/boot/Image $OUTDIR/
 
-    # TODO: Add your kernel build steps here
-fi
+################################
+# Build BusyBox
+################################
 
-echo "Adding the Image in outdir"
+cd $OUTDIR
 
-echo "Creating the staging directory for the root filesystem"
-cd "$OUTDIR"
-if [ -d "${OUTDIR}/rootfs" ]
-then
-	echo "Deleting rootfs directory at ${OUTDIR}/rootfs and starting over"
-    sudo rm  -rf ${OUTDIR}/rootfs
+if [ ! -d "busybox-${BUSYBOX_VERSION}" ]; then
+    wget https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2
+    tar -xjf busybox-${BUSYBOX_VERSION}.tar.bz2
 fi
 
-# TODO: Create necessary base directories
+cd busybox-${BUSYBOX_VERSION}
+make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
+sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
+make -j$(nproc) ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE}
+make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} CONFIG_PREFIX=$OUTDIR/rootfs install
 
-cd "$OUTDIR"
-if [ ! -d "${OUTDIR}/busybox" ]
-then
-git clone git://busybox.net/busybox.git
-    cd busybox
-    git checkout ${BUSYBOX_VERSION}
-    # TODO:  Configure busybox
-else
-    cd busybox
-fi
+################################
+# Create RootFS Layout
+################################
 
-# TODO: Make and install busybox
+cd $OUTDIR/rootfs
+mkdir -p dev proc sys tmp home
 
-echo "Library dependencies"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
+sudo mknod -m 666 dev/null c 1 3 || true
+sudo mknod -m 600 dev/console c 5 1 || true
 
-# TODO: Add library dependencies to rootfs
+################################
+# Cross Compile Writer
+################################
 
-# TODO: Make device nodes
+cd $REPO_ROOT/finder-app
+make clean
+make CROSS_COMPILE=${CROSS_COMPILE}
+cp writer $OUTDIR/rootfs/home/
+chmod +x $OUTDIR/rootfs/home/writer
 
-# TODO: Clean and build the writer utility
+################################
+# Copy Assignment Files
+################################
+mkdir -p $OUTDIR/rootfs/home/conf
+cp $REPO_ROOT/finder-app/finder.sh $OUTDIR/rootfs/home/
+cp $REPO_ROOT/finder-app/finder-test.sh $OUTDIR/rootfs/home/
+cp $REPO_ROOT/finder-app/autorun-qemu.sh $OUTDIR/rootfs/home/
+cp $REPO_ROOT/finder-app/conf/username.txt $OUTDIR/rootfs/home/conf/
+cp $REPO_ROOT/finder-app/conf/assignment.txt $OUTDIR/rootfs/home/conf/
 
-# TODO: Copy the finder related scripts and executables to the /home directory
-# on the target rootfs
+################################
+# Fix finder-test.sh path
+################################
 
-# TODO: Chown the root directory
+sed -i 's|../conf/assignment.txt|conf/assignment.txt|' \
+$OUTDIR/rootfs/home/finder-test.sh
 
-# TODO: Create initramfs.cpio.gz
+chmod +x $OUTDIR/rootfs/home/finder.sh
+chmod +x $OUTDIR/rootfs/home/finder-test.sh
+chmod +x $OUTDIR/rootfs/home/autorun-qemu.sh
+
+################################
+# Create initramfs
+################################
+
+cd $OUTDIR/rootfs
+find . | cpio -H newc -ov --owner root:root > $OUTDIR/initramfs.cpio
+gzip -f $OUTDIR/initramfs.cpio
+
+echo "Build complete."
